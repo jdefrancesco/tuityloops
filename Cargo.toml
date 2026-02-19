@@ -1,0 +1,13 @@
+[package]
+name = "tuityloops"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+crossterm= "0.27"
+ratatui = "0.26"
+
+cpal = "0.15"
+crossbeam-channel = "0.5"
+hound = "3"
