@@ -7,7 +7,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Terminal,
@@ -21,8 +21,28 @@ use std::{
     time::Duration,
 };
 
-const STEPS: usize = 16;
-const LANES: usize = 4;
+const STEPS_PER_BAR: usize = 16;
+const BARS: usize = 16;
+const STEPS: usize = STEPS_PER_BAR * BARS;
+const LANES: usize = 6;
+
+fn lane_color(lane: usize) -> Color {
+    match lane {
+        0 => Color::Red,      // Kick
+        1 => Color::Yellow,   // Snare
+        2 => Color::Cyan,     // Hat
+        3 => Color::Magenta,  // Clap
+        4 => Color::Green,    // Tom
+        5 => Color::Blue,     // Rim
+        _ => Color::White,
+    }
+}
+
+fn block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+}
 
 #[derive(Clone, Copy)]
 struct Lane {
@@ -80,6 +100,8 @@ fn main() -> Result<()> {
         Lane { name: "Snare" },
         Lane { name: "Hat" },
         Lane { name: "Clap" },
+        Lane { name: "Tom" },
+        Lane { name: "Rim" },
     ];
 
     let mut pat = Pattern {
@@ -87,16 +109,24 @@ fn main() -> Result<()> {
         grid: [[false; STEPS]; LANES],
     };
 
-    // default beat
-    for &s in &[0, 4, 8, 12] {
-        pat.grid[0][s] = true;
-    } // kick
-    for &s in &[4, 12] {
-        pat.grid[1][s] = true;
-    } // snare
-    for s in 0..STEPS {
-        pat.grid[2][s] = true;
-    } // hats
+    // default beat (repeat across all bars)
+    for bar in 0..BARS {
+        let base = bar * STEPS_PER_BAR;
+        for &s in &[0, 4, 8, 12] {
+            pat.grid[0][base + s] = true;
+        } // kick
+        for &s in &[4, 12] {
+            pat.grid[1][base + s] = true;
+        } // snare
+        for s in 0..STEPS_PER_BAR {
+            pat.grid[2][base + s] = true;
+        } // hats
+
+        // light percussion by default
+        for &s in &[2, 6, 10, 14] {
+            pat.grid[5][base + s] = true;
+        } // rim
+    }
 
     let mut app = App {
         lanes,
@@ -208,24 +238,42 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
         .split(f.size());
 
     let step = app.playhead_step.load(Ordering::Relaxed) % STEPS;
+    let bar = (step / STEPS_PER_BAR) % BARS;
+    let beat = (step % STEPS_PER_BAR) / 4;
+    let sub = step % 4;
 
     // Header
+    let playing_style = if app.playing {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+
     let header = Paragraph::new(Line::from(vec![
-        Span::raw("BPM: "),
-        Span::styled(format!("{:.0}", app.pat.bpm), Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("   Playing: "),
+        Span::styled("BPM: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            if app.playing { "Yes" } else { "No" },
-            Style::default().add_modifier(Modifier::BOLD),
+            format!("{:.0}", app.pat.bpm),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("   Step: {:02X}", step)),
-        Span::raw("   Master: "),
+        Span::raw("   "),
+        Span::styled("Playing: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(if app.playing { "Yes" } else { "No" }, playing_style),
+        Span::raw("   "),
+        Span::styled(
+            format!("Pos: {:02}/{:02}  {}.{}.{}", step, STEPS - 1, bar + 1, beat + 1, sub + 1),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("   "),
+        Span::styled("Master: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{:.2}", app.master_gain),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
         ),
     ]))
-    .block(Block::default().borders(Borders::ALL).title("Beat TUI (Realtime)"));
+    .block(block().title(Span::styled(
+        "TuityLoops",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
     f.render_widget(header, root[0]);
 
     // Main grid
@@ -240,32 +288,103 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
         .enumerate()
         .map(|(i, l)| {
             let sel = if i == app.cursor_lane { ">" } else { " " };
-            Line::from(format!("{sel} {}", l.name))
+            let style = if i == app.cursor_lane {
+                Style::default()
+                    .fg(lane_color(i))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(lane_color(i)).add_modifier(Modifier::DIM)
+            };
+            Line::from(vec![
+                Span::styled(format!("{sel} "), Style::default().fg(Color::DarkGray)),
+                Span::styled(l.name, style),
+            ])
         })
         .collect::<Vec<_>>();
 
-    let lane_panel = Paragraph::new(lane_lines)
-        .block(Block::default().borders(Borders::ALL).title("Lanes"));
+    let lane_panel = Paragraph::new(lane_lines).block(block().title("Lanes"));
     f.render_widget(lane_panel, main[0]);
 
     let mut lines: Vec<Line> = Vec::new();
 
-    let header_steps = (0..STEPS)
-        .map(|s| Span::styled(format!(" {s:X}"), Style::default().add_modifier(Modifier::DIM)))
-        .collect::<Vec<_>>();
-    lines.push(Line::from(header_steps));
+    // Horizontal viewport: show as many full bars as fit.
+    // Each bar is 16 steps; each step cell is 2 chars, plus 3 beat separators (2 chars each),
+    // plus bar separators between bars (2 chars).
+    let steps_inner_width = main[1].width.saturating_sub(2) as usize;
+    let approx_bar_width = 32 + 3 * 2 + 2; // ~40
+    let mut bars_per_view = (steps_inner_width / approx_bar_width).max(1);
+    bars_per_view = bars_per_view.min(BARS);
+
+    let cursor_bar = (app.cursor_step / STEPS_PER_BAR).min(BARS - 1);
+    let half = bars_per_view / 2;
+    let view_start_bar = cursor_bar.saturating_sub(half).min(BARS - bars_per_view);
+    let view_end_bar = view_start_bar + bars_per_view - 1;
+    let view_start_step = view_start_bar * STEPS_PER_BAR;
+    let view_end_step = ((view_end_bar + 1) * STEPS_PER_BAR).min(STEPS);
+
+    // Beat ruler (shows beat numbers 1..4 for each bar in view)
+    let mut ruler: Vec<Span> = Vec::new();
+    for st in view_start_step..view_end_step {
+        if st > view_start_step {
+            if st % STEPS_PER_BAR == 0 {
+                ruler.push(Span::styled(
+                    " ║",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                ));
+            } else if st % 4 == 0 {
+                ruler.push(Span::styled(
+                    " │",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                ));
+            }
+        }
+
+        let beat_num = ((st % STEPS_PER_BAR) / 4) + 1;
+        if st % 4 == 0 {
+            ruler.push(Span::styled(
+                format!(" {beat_num}"),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ));
+        } else {
+            ruler.push(Span::styled(
+                "  ",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ));
+        }
+    }
+    lines.push(Line::from(ruler));
 
     for lane in 0..LANES {
         let mut spans: Vec<Span> = Vec::new();
-        for st in 0..STEPS {
+        for st in view_start_step..view_end_step {
+            if st > view_start_step {
+                if st % STEPS_PER_BAR == 0 {
+                    spans.push(Span::styled(
+                        " ║",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    ));
+                } else if st % 4 == 0 {
+                    spans.push(Span::styled(
+                        " │",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    ));
+                }
+            }
             let on = app.pat.grid[lane][st];
             let is_cursor = lane == app.cursor_lane && st == app.cursor_step;
             let is_playhead = app.playing && st == step;
 
             let ch = if on { "■" } else { "·" };
-            let mut style = Style::default();
+            let mut style = if on {
+                Style::default().fg(lane_color(lane)).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
             if is_playhead {
-                style = style.add_modifier(Modifier::BOLD);
+                style = style
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::UNDERLINED);
             }
             if is_cursor {
                 style = style.add_modifier(Modifier::REVERSED);
@@ -275,13 +394,20 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
         lines.push(Line::from(spans));
     }
 
-    let grid = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Steps"));
+    let grid_title = format!(
+        "Steps (Bars {}-{} / {})",
+        view_start_bar + 1,
+        view_end_bar + 1,
+        BARS
+    );
+    let grid = Paragraph::new(lines).block(block().title(grid_title));
     f.render_widget(grid, main[1]);
 
     let footer = Paragraph::new(
         "Controls: arrows=move  space=toggle  p=play  +/- BPM  [ ] master  r=render out.wav  q=quit",
     )
-    .block(Block::default().borders(Borders::ALL));
+    .style(Style::default().fg(Color::DarkGray))
+    .block(block());
     f.render_widget(footer, root[2]);
 }
 
@@ -364,6 +490,8 @@ struct EngineState {
     snare: DrumSnare,
     hat: DrumHat,
     clap: DrumClap,
+    tom: DrumTom,
+    rim: DrumRim,
 
     playhead_step: Arc<AtomicUsize>,
 }
@@ -388,6 +516,8 @@ impl EngineState {
             snare: DrumSnare::new(sr),
             hat: DrumHat::new(sr),
             clap: DrumClap::new(sr),
+            tom: DrumTom::new(sr),
+            rim: DrumRim::new(sr),
 
             playhead_step,
         }
@@ -410,6 +540,8 @@ impl EngineState {
                         self.snare.reset();
                         self.hat.reset();
                         self.clap.reset();
+                        self.tom.reset();
+                        self.rim.reset();
                     }
                 }
                 EngineCmd::SetBpm(b) => {
@@ -450,6 +582,12 @@ impl EngineState {
             if self.grid[3][self.step_index] {
                 self.clap.trigger();
             }
+            if self.grid[4][self.step_index] {
+                self.tom.trigger();
+            }
+            if self.grid[5][self.step_index] {
+                self.rim.trigger();
+            }
         }
     }
 
@@ -457,7 +595,9 @@ impl EngineState {
         let s = self.kick.next()
             + self.snare.next()
             + self.hat.next()
-            + self.clap.next();
+            + self.clap.next()
+            + self.tom.next()
+            + self.rim.next();
         (s.tanh()) * self.master_gain
     }
 
@@ -560,12 +700,11 @@ impl DrumSnare {
 }
 
 struct DrumHat {
-    sr: f32,
     env: f32,
     noise: u32,
 }
 impl DrumHat {
-    fn new(sr: f32) -> Self { Self { sr, env: 0.0, noise: 0xdeadbeef } }
+    fn new(_sr: f32) -> Self { Self { env: 0.0, noise: 0xdeadbeef } }
     fn trigger(&mut self) { self.env = 1.0; }
     fn reset(&mut self) { self.env = 0.0; }
     fn next(&mut self) -> f32 {
@@ -578,13 +717,12 @@ impl DrumHat {
 }
 
 struct DrumClap {
-    sr: f32,
     env: f32,
     noise: u32,
     burst_phase: usize,
 }
 impl DrumClap {
-    fn new(sr: f32) -> Self { Self { sr, env: 0.0, noise: 0xa5a5a5a5, burst_phase: 0 } }
+    fn new(_sr: f32) -> Self { Self { env: 0.0, noise: 0xa5a5a5a5, burst_phase: 0 } }
     fn trigger(&mut self) { self.env = 1.0; self.burst_phase = 0; }
     fn reset(&mut self) { self.env = 0.0; self.burst_phase = 0; }
     fn next(&mut self) -> f32 {
@@ -607,11 +745,79 @@ impl DrumClap {
     }
 }
 
+struct DrumTom {
+    sr: f32,
+    t: f32,
+    env: f32,
+    phase: f32,
+}
+impl DrumTom {
+    fn new(sr: f32) -> Self {
+        Self { sr, t: 0.0, env: 0.0, phase: 0.0 }
+    }
+    fn trigger(&mut self) {
+        self.t = 0.0;
+        self.env = 1.0;
+    }
+    fn reset(&mut self) {
+        self.env = 0.0;
+        self.t = 0.0;
+    }
+    fn next(&mut self) -> f32 {
+        if self.env <= 0.0001 {
+            return 0.0;
+        }
+        let freq = 160.0 + 120.0 * (-self.t * 14.0).exp();
+        self.phase += 2.0 * std::f32::consts::PI * freq / self.sr;
+        if self.phase > 2.0 * std::f32::consts::PI {
+            self.phase -= 2.0 * std::f32::consts::PI;
+        }
+        let s = self.phase.sin();
+        self.env *= 0.996;
+        self.t += 1.0 / self.sr;
+        s * self.env * 0.7
+    }
+}
+
+struct DrumRim {
+    env: f32,
+    noise: u32,
+    tone_phase: f32,
+    sr: f32,
+}
+impl DrumRim {
+    fn new(sr: f32) -> Self {
+        Self { env: 0.0, noise: 0x31415926, tone_phase: 0.0, sr }
+    }
+    fn trigger(&mut self) {
+        self.env = 1.0;
+    }
+    fn reset(&mut self) {
+        self.env = 0.0;
+    }
+    fn next(&mut self) -> f32 {
+        if self.env <= 0.0001 {
+            return 0.0;
+        }
+
+        self.noise = self.noise.wrapping_mul(1664525).wrapping_add(1013904223);
+        let n = ((self.noise >> 9) as f32 / (u32::MAX >> 9) as f32) * 2.0 - 1.0;
+
+        let tone_f = 2400.0;
+        self.tone_phase += 2.0 * std::f32::consts::PI * tone_f / self.sr;
+        if self.tone_phase > 2.0 * std::f32::consts::PI {
+            self.tone_phase -= 2.0 * std::f32::consts::PI;
+        }
+        let tone = self.tone_phase.sin();
+
+        self.env *= 0.94;
+        (tone * 0.6 + n * 0.15) * self.env * 0.7
+    }
+}
+
 
 fn render_wav(pat: &Pattern, path: &str) -> Result<()> {
     let sample_rate = 44_100u32;
-    let seconds = 4.0;
-    let frames = (seconds * sample_rate as f32) as usize;
 
     let spec = hound::WavSpec {
         channels: 2,
@@ -624,12 +830,16 @@ fn render_wav(pat: &Pattern, path: &str) -> Result<()> {
     let bpm = pat.bpm;
     let sec_per_beat = 60.0 / bpm;
     let sec_per_step = sec_per_beat / 4.0;
+    let seconds = sec_per_step * STEPS as f32;
+    let frames = (seconds * sample_rate as f32) as usize;
     let samples_per_step = (sec_per_step * sample_rate as f32) as usize;
 
     let mut kick = DrumKick::new(sample_rate as f32);
     let mut snare = DrumSnare::new(sample_rate as f32);
     let mut hat = DrumHat::new(sample_rate as f32);
     let mut clap = DrumClap::new(sample_rate as f32);
+    let mut tom = DrumTom::new(sample_rate as f32);
+    let mut rim = DrumRim::new(sample_rate as f32);
 
     for i in 0..frames {
         let step = (i / samples_per_step) % STEPS;
@@ -640,9 +850,13 @@ fn render_wav(pat: &Pattern, path: &str) -> Result<()> {
             if pat.grid[1][step] { snare.trigger(); }
             if pat.grid[2][step] { hat.trigger(); }
             if pat.grid[3][step] { clap.trigger(); }
+            if pat.grid[4][step] { tom.trigger(); }
+            if pat.grid[5][step] { rim.trigger(); }
         }
 
-        let s = (kick.next() + snare.next() + hat.next() + clap.next()).tanh() * 0.7;
+        let s = (kick.next() + snare.next() + hat.next() + clap.next() + tom.next() + rim.next())
+            .tanh()
+            * 0.7;
         let v = (s * i16::MAX as f32) as i16;
         w.write_sample(v)?;
         w.write_sample(v)?;
