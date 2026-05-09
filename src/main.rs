@@ -77,24 +77,26 @@ struct App {
     // playhead from audio thread
     playhead_step: Arc<AtomicUsize>,
 
-    // ui -> audio
+    // ui to audio
     tx: crossbeam_channel::Sender<EngineCmd>,
 }
 
 fn main() -> Result<()> {
-    // ---- UI + terminal init ----
+
+    // Dark tty magic happens here!
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // ---- Engine init ----
+    // Initialize engine
     let (tx, rx) = crossbeam_channel::unbounded::<EngineCmd>();
     let playhead_step = Arc::new(AtomicUsize::new(0));
     let _audio = AudioEngine::start(rx, playhead_step.clone())?;
 
-    // ---- App init ----
+    // Initial sounds the user can play with
+    // Please feel free to add more!
     let lanes = [
         Lane { name: "Kick" },
         Lane { name: "Snare" },
@@ -154,14 +156,14 @@ fn main() -> Result<()> {
             }
         }
     }
-    // ---- Main loop ----
+    //
+    // Main loop
     let res = run_app(&mut terminal, &mut app);
 
-    // ---- Cleanup ----
+    // Clean up any mess we made.
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
-
     res
 }
 
@@ -180,6 +182,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     Ok(())
 }
 
+// handle_ley is important. We may need to reithink it's modality in the future.
 fn handle_key(app: &mut App, k: KeyEvent) -> Result<bool> {
     match (k.code, k.modifiers) {
         (KeyCode::Char('q'), _) => return Ok(true),
@@ -302,7 +305,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
         })
         .collect::<Vec<_>>();
 
-    let lane_panel = Paragraph::new(lane_lines).block(block().title("Lanes"));
+    let lane_panel = Paragraph::new(lane_lines).block(block().title("Tracks"));
     f.render_widget(lane_panel, main[0]);
 
     let mut lines: Vec<Line> = Vec::new();
@@ -652,6 +655,7 @@ struct DrumKick {
     phase: f32,
 }
 impl DrumKick {
+
     fn new(sr: f32) -> Self {
         Self { sr, t: 0.0, env: 0.0, phase: 0.0 }
     }
