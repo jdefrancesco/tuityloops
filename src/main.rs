@@ -6,10 +6,10 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Terminal,
 };
 use std::{
@@ -25,6 +25,24 @@ const STEPS_PER_BAR: usize = 16;
 const BARS: usize = 16;
 const STEPS: usize = STEPS_PER_BAR * BARS;
 const LANES: usize = 6;
+
+// Master gain is applied as *drive* before the soft-clipper, so values above
+// 1.0 push the mix harder into saturation (louder + punchier) instead of only
+// attenuating it like the old post-clip multiply did.
+const MASTER_GAIN_MIN: f32 = 0.0;
+const MASTER_GAIN_MAX: f32 = 4.0;
+const MASTER_GAIN_STEP: f32 = 0.1;
+const MASTER_GAIN_DEFAULT: f32 = 1.5;
+
+// Per-voice output level ("how hard each drum hits"). These feed the summed mix
+// that gets driven into the soft-clipper, so bumping them makes the kit punchier
+// and more present. Tune these to rebalance the kit.
+const KICK_GAIN: f32 = 1.8;
+const SNARE_GAIN: f32 = 1.2;
+const HAT_GAIN: f32 = 0.4;
+const CLAP_GAIN: f32 = 0.85;
+const TOM_GAIN: f32 = 1.1;
+const RIM_GAIN: f32 = 1.0;
 
 fn lane_color(lane: usize) -> Color {
     match lane {
@@ -73,6 +91,9 @@ struct App {
 
     cursor_lane: usize,
     cursor_step: usize,
+
+    // whether the help overlay is visible
+    show_help: bool,
 
     // playhead from audio thread
     playhead_step: Arc<AtomicUsize>,
@@ -134,9 +155,10 @@ fn main() -> Result<()> {
         lanes,
         pat,
         playing: false,
-        master_gain: 0.8,
+        master_gain: MASTER_GAIN_DEFAULT,
         cursor_lane: 0,
         cursor_step: 0,
+        show_help: false,
         playhead_step,
         tx,
     };
@@ -184,9 +206,22 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 
 // handle_ley is important. We may need to reithink it's modality in the future.
 fn handle_key(app: &mut App, k: KeyEvent) -> Result<bool> {
+    // Quitting always works, even from the help overlay.
     match (k.code, k.modifiers) {
         (KeyCode::Char('q'), _) => return Ok(true),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
+        _ => {}
+    }
+
+    // While the help overlay is open, any other key dismisses it and is
+    // otherwise swallowed so it doesn't also edit the pattern.
+    if app.show_help {
+        app.show_help = false;
+        return Ok(false);
+    }
+
+    match (k.code, k.modifiers) {
+        (KeyCode::Char('?'), _) => app.show_help = true,
 
         (KeyCode::Char('p'), _) => {
             app.playing = !app.playing;
@@ -206,6 +241,29 @@ fn handle_key(app: &mut App, k: KeyEvent) -> Result<bool> {
             let _ = app.tx.send(EngineCmd::ToggleStep { lane, step, on });
         }
 
+        (KeyCode::Char('x'), _) => {
+            // Clear every step in the current lane's row.
+            let lane = app.cursor_lane;
+            for step in 0..STEPS {
+                if app.pat.grid[lane][step] {
+                    app.pat.grid[lane][step] = false;
+                    let _ = app.tx.send(EngineCmd::ToggleStep { lane, step, on: false });
+                }
+            }
+        }
+
+        (KeyCode::Char('X'), _) => {
+            // Clear every step in every lane.
+            for lane in 0..LANES {
+                for step in 0..STEPS {
+                    if app.pat.grid[lane][step] {
+                        app.pat.grid[lane][step] = false;
+                        let _ = app.tx.send(EngineCmd::ToggleStep { lane, step, on: false });
+                    }
+                }
+            }
+        }
+
         (KeyCode::Char('+') | KeyCode::Char('='), _) => {
             app.pat.bpm = (app.pat.bpm + 1.0).min(300.0);
             let _ = app.tx.send(EngineCmd::SetBpm(app.pat.bpm));
@@ -216,11 +274,11 @@ fn handle_key(app: &mut App, k: KeyEvent) -> Result<bool> {
         }
 
         (KeyCode::Char(']'), _) => {
-            app.master_gain = (app.master_gain + 0.05).min(1.0);
+            app.master_gain = (app.master_gain + MASTER_GAIN_STEP).min(MASTER_GAIN_MAX);
             let _ = app.tx.send(EngineCmd::SetMasterGain(app.master_gain));
         }
         (KeyCode::Char('['), _) => {
-            app.master_gain = (app.master_gain - 0.05).max(0.0);
+            app.master_gain = (app.master_gain - MASTER_GAIN_STEP).max(MASTER_GAIN_MIN);
             let _ = app.tx.send(EngineCmd::SetMasterGain(app.master_gain));
         }
 
@@ -318,9 +376,12 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
     let mut bars_per_view = (steps_inner_width / approx_bar_width).max(1);
     bars_per_view = bars_per_view.min(BARS);
 
-    let cursor_bar = (app.cursor_step / STEPS_PER_BAR).min(BARS - 1);
+    // While playing, follow the playhead so you can watch it sweep and loop;
+    // when stopped, follow the edit cursor so you can navigate the pattern.
+    let focus_step = if app.playing { step } else { app.cursor_step };
+    let focus_bar = (focus_step / STEPS_PER_BAR).min(BARS - 1);
     let half = bars_per_view / 2;
-    let view_start_bar = cursor_bar.saturating_sub(half).min(BARS - bars_per_view);
+    let view_start_bar = focus_bar.saturating_sub(half).min(BARS - bars_per_view);
     let view_end_bar = view_start_bar + bars_per_view - 1;
     let view_start_step = view_start_bar * STEPS_PER_BAR;
     let view_end_step = ((view_end_bar + 1) * STEPS_PER_BAR).min(STEPS);
@@ -407,11 +468,70 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(grid, main[1]);
 
     let footer = Paragraph::new(
-        "Controls: arrows=move  space=toggle  p=play  +/- BPM  [ ] master  r=render out.wav  q=quit",
+        "arrows=move  space=toggle  p=play  x=clear row  X=clear all  +/- BPM  [ ] master  r=render  ?=help  q=quit",
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(block());
     f.render_widget(footer, root[2]);
+
+    if app.show_help {
+        draw_help(f);
+    }
+}
+
+/// Render a centered modal overlay listing every keybinding.
+fn draw_help(f: &mut ratatui::Frame) {
+    let key_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::Gray);
+
+    let entry = |key: &str, desc: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {key:<12}"), key_style),
+            Span::styled(desc.to_string(), desc_style),
+        ])
+    };
+
+    let lines = vec![
+        Line::from(""),
+        entry("↑ / ↓", "Move cursor between tracks"),
+        entry("← / →", "Move cursor between steps"),
+        entry("space", "Toggle the step under the cursor"),
+        entry("x", "Clear the current track's row"),
+        entry("X", "Clear all tracks"),
+        entry("p", "Play / stop the sequencer"),
+        entry("+ / -", "Increase / decrease BPM"),
+        entry("] / [", "Raise / lower master volume"),
+        entry("r", "Render the pattern to out.wav"),
+        entry("?", "Toggle this help"),
+        entry("q / Ctrl-C", "Quit"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Press any key to close",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )),
+    ];
+
+    let area = centered_rect(56, lines.len() as u16 + 2, f.size());
+    let help = Paragraph::new(lines).block(
+        block()
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                " Help ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )),
+    );
+
+    f.render_widget(Clear, area);
+    f.render_widget(help, area);
+}
+
+/// Compute a centered `Rect` of the given width/height, clamped to `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect { x, y, width, height }
 }
 
 
@@ -508,7 +628,7 @@ impl EngineState {
             sr,
             playing: false,
             bpm,
-            master_gain: 0.8,
+            master_gain: MASTER_GAIN_DEFAULT,
             grid: [[false; STEPS]; LANES],
 
             samples_per_step,
@@ -531,8 +651,12 @@ impl EngineState {
             match cmd {
                 EngineCmd::SetPlaying(p) => {
                     if p && !self.playing {
-                        // starting playback, reset timing to stay in sync with UI
+                        // Start cleanly on the downbeat: prime the phase so the
+                        // first callback advances a step immediately, and set the
+                        // index so that first step lands on 0 (not 1).
                         self.step_phase = self.samples_per_step;
+                        self.step_index = STEPS - 1;
+                        self.playhead_step.store(0, Ordering::Relaxed);
                     }
                     self.playing = p;
                     if !p {
@@ -556,7 +680,9 @@ impl EngineState {
                         self.grid[lane][step] = on;
                     }
                 }
-                EngineCmd::SetMasterGain(g) => self.master_gain = g.clamp(0.0, 1.0),
+                EngineCmd::SetMasterGain(g) => {
+                    self.master_gain = g.clamp(MASTER_GAIN_MIN, MASTER_GAIN_MAX)
+                }
             }
         }
     }
@@ -601,7 +727,9 @@ impl EngineState {
             + self.clap.next()
             + self.tom.next()
             + self.rim.next();
-        (s.tanh()) * self.master_gain
+        // Drive the summed mix into the soft-clipper. Higher master_gain means
+        // a hotter, harder-hitting signal that still can't clip past +/-1.0.
+        (s * self.master_gain).tanh()
     }
 
     fn render_f32(&mut self, out: &mut [f32], ch: usize) {
@@ -672,7 +800,7 @@ impl DrumKick {
         let s = self.phase.sin();
         self.env *= 0.9975;
         self.t += 1.0 / self.sr;
-        s * self.env * 1.2
+        s * self.env * KICK_GAIN
     }
 }
 
@@ -699,7 +827,7 @@ impl DrumSnare {
         let tone = self.tone_phase.sin() * 0.25;
 
         self.env *= 0.994;
-        (n * 0.8 + tone) * self.env * 0.8
+        (n * 0.8 + tone) * self.env * SNARE_GAIN
     }
 }
 
@@ -716,7 +844,7 @@ impl DrumHat {
         self.noise = self.noise.wrapping_mul(1103515245).wrapping_add(12345);
         let n = ((self.noise >> 10) as f32 / (u32::MAX >> 10) as f32) * 2.0 - 1.0;
         self.env *= 0.985;
-        n * self.env * 0.25
+        n * self.env * HAT_GAIN
     }
 }
 
@@ -745,7 +873,7 @@ impl DrumClap {
         self.burst_phase += 1;
 
         self.env *= 0.992;
-        n * self.env * gate * 0.5
+        n * self.env * gate * CLAP_GAIN
     }
 }
 
@@ -779,7 +907,7 @@ impl DrumTom {
         let s = self.phase.sin();
         self.env *= 0.996;
         self.t += 1.0 / self.sr;
-        s * self.env * 0.7
+        s * self.env * TOM_GAIN
     }
 }
 
@@ -815,7 +943,7 @@ impl DrumRim {
         let tone = self.tone_phase.sin();
 
         self.env *= 0.94;
-        (tone * 0.6 + n * 0.15) * self.env * 0.7
+        (tone * 0.6 + n * 0.15) * self.env * RIM_GAIN
     }
 }
 
@@ -868,4 +996,147 @@ fn render_wav(pat: &Pattern, path: &str) -> Result<()> {
 
     w.finalize()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an App wired to a live channel (receiver kept alive so sends
+    /// succeed) for exercising `handle_key` in isolation.
+    fn test_app() -> (App, crossbeam_channel::Receiver<EngineCmd>) {
+        let (tx, rx) = crossbeam_channel::unbounded::<EngineCmd>();
+        let lanes = [
+            Lane { name: "Kick" },
+            Lane { name: "Snare" },
+            Lane { name: "Hat" },
+            Lane { name: "Clap" },
+            Lane { name: "Tom" },
+            Lane { name: "Rim" },
+        ];
+        let app = App {
+            lanes,
+            pat: Pattern {
+                bpm: 120.0,
+                grid: [[false; STEPS]; LANES],
+            },
+            playing: false,
+            master_gain: MASTER_GAIN_DEFAULT,
+            cursor_lane: 0,
+            cursor_step: 0,
+            show_help: false,
+            playhead_step: Arc::new(AtomicUsize::new(0)),
+            tx,
+        };
+        (app, rx)
+    }
+
+    fn press(app: &mut App, c: char) -> bool {
+        handle_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)).unwrap()
+    }
+
+    #[test]
+    fn question_mark_toggles_help_overlay() {
+        let (mut app, _rx) = test_app();
+        assert!(!app.show_help);
+        press(&mut app, '?');
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn any_key_dismisses_help_without_editing_pattern() {
+        let (mut app, _rx) = test_app();
+        app.show_help = true;
+        // Space would normally toggle a step; while help is open it must not.
+        press(&mut app, ' ');
+        assert!(!app.show_help);
+        assert!(!app.pat.grid[0][0], "pattern should be untouched while help was open");
+    }
+
+    #[test]
+    fn quit_works_even_with_help_open() {
+        let (mut app, _rx) = test_app();
+        app.show_help = true;
+        assert!(press(&mut app, 'q'), "q should quit");
+    }
+
+    #[test]
+    fn clear_row_clears_only_current_lane() {
+        let (mut app, _rx) = test_app();
+        app.pat.grid[0][0] = true;
+        app.pat.grid[0][8] = true;
+        app.pat.grid[1][4] = true; // different lane, must survive
+        app.cursor_lane = 0;
+
+        press(&mut app, 'x');
+
+        assert!(!app.pat.grid[0][0]);
+        assert!(!app.pat.grid[0][8]);
+        assert!(app.pat.grid[1][4], "other lanes should be untouched");
+    }
+
+    #[test]
+    fn clear_all_clears_every_lane() {
+        let (mut app, _rx) = test_app();
+        app.pat.grid[0][0] = true;
+        app.pat.grid[3][7] = true;
+        app.pat.grid[5][15] = true;
+
+        press(&mut app, 'X');
+
+        for lane in 0..LANES {
+            for step in 0..STEPS {
+                assert!(!app.pat.grid[lane][step], "lane {lane} step {step} not cleared");
+            }
+        }
+    }
+
+    #[test]
+    fn clear_row_emits_toggle_off_for_set_steps() {
+        let (mut app, rx) = test_app();
+        app.pat.grid[2][3] = true;
+        app.cursor_lane = 2;
+
+        press(&mut app, 'x');
+
+        let cmd = rx.try_recv().expect("expected a ToggleStep command");
+        match cmd {
+            EngineCmd::ToggleStep { lane, step, on } => {
+                assert_eq!((lane, step, on), (2, 3, false));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bracket_keys_adjust_master_gain_by_one_step() {
+        let (mut app, _rx) = test_app();
+        let start = app.master_gain;
+
+        press(&mut app, ']');
+        assert!((app.master_gain - (start + MASTER_GAIN_STEP)).abs() < f32::EPSILON);
+
+        press(&mut app, '[');
+        assert!((app.master_gain - start).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn master_gain_can_boost_above_unity() {
+        let (mut app, _rx) = test_app();
+        // Default already sits above 1.0, so boosting must be allowed.
+        assert!(MASTER_GAIN_DEFAULT > 1.0);
+        for _ in 0..100 {
+            press(&mut app, ']');
+        }
+        assert!((app.master_gain - MASTER_GAIN_MAX).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn master_gain_floors_at_min() {
+        let (mut app, _rx) = test_app();
+        for _ in 0..100 {
+            press(&mut app, '[');
+        }
+        assert!((app.master_gain - MASTER_GAIN_MIN).abs() < f32::EPSILON);
+    }
 }
