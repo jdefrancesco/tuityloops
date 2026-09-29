@@ -1,4 +1,6 @@
 use anyhow::Result;
+mod samples;
+use samples::{SampleEditor, SampleSlice, SampleVoice};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -22,7 +24,7 @@ use std::{
 };
 
 const STEPS_PER_BAR: usize = 16;
-const BARS: usize = 16;
+const BARS: usize = 2;
 const STEPS: usize = STEPS_PER_BAR * BARS;
 const LANES: usize = 6;
 
@@ -79,7 +81,8 @@ enum EngineCmd {
     SetBpm(f32),
     ToggleStep { lane: usize, step: usize, on: bool },
     SetMasterGain(f32),
-    // later: lane gain/pan, sample load, etc.
+    SetSample { lane: usize, sample: Option<SampleSlice> },
+    Preview(Option<SampleSlice>),
 }
 
 struct App {
@@ -94,6 +97,9 @@ struct App {
 
     // whether the help overlay is visible
     show_help: bool,
+    samples: [Option<SampleSlice>; LANES],
+    sample_editor: Option<SampleEditor>,
+    status: String,
 
     // playhead from audio thread
     playhead_step: Arc<AtomicUsize>,
@@ -159,6 +165,9 @@ fn main() -> Result<()> {
         cursor_lane: 0,
         cursor_step: 0,
         show_help: false,
+        samples: std::array::from_fn(|_| None),
+        sample_editor: None,
+        status: String::new(),
         playhead_step,
         tx,
     };
@@ -206,6 +215,13 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
 
 // handle_ley is important. We may need to reithink it's modality in the future.
 fn handle_key(app: &mut App, k: KeyEvent) -> Result<bool> {
+    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return Ok(true);
+    }
+    if app.sample_editor.is_some() {
+        samples::handle_editor_key(app, k);
+        return Ok(false);
+    }
     // Quitting always works, even from the help overlay.
     match (k.code, k.modifiers) {
         (KeyCode::Char('q'), _) => return Ok(true),
@@ -222,6 +238,9 @@ fn handle_key(app: &mut App, k: KeyEvent) -> Result<bool> {
 
     match (k.code, k.modifiers) {
         (KeyCode::Char('?'), _) => app.show_help = true,
+        (KeyCode::Char('s'), _) => {
+            app.sample_editor = Some(SampleEditor::new(app.samples[app.cursor_lane].clone()));
+        }
 
         (KeyCode::Char('p'), _) => {
             app.playing = !app.playing;
@@ -284,7 +303,10 @@ fn handle_key(app: &mut App, k: KeyEvent) -> Result<bool> {
 
         (KeyCode::Char('r'), _) => {
             // Optional: offline render still useful
-            render_wav(&app.pat, "out.wav")?;
+            app.status = match render_wav(&app.pat, &app.samples, app.master_gain, "out.wav") {
+                Ok(()) => "Rendered out.wav".into(),
+                Err(e) => format!("Render failed: {e}"),
+            };
         }
 
         _ => {}
@@ -295,7 +317,7 @@ fn handle_key(app: &mut App, k: KeyEvent) -> Result<bool> {
 fn draw_ui(f: &mut ratatui::Frame, app: &App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(10), Constraint::Length(2)])
+        .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(4)])
         .split(f.size());
 
     let step = app.playhead_step.load(Ordering::Relaxed) % STEPS;
@@ -358,7 +380,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
             };
             Line::from(vec![
                 Span::styled(format!("{sel} "), Style::default().fg(Color::DarkGray)),
-                Span::styled(l.name, style),
+                Span::styled(if app.samples[i].is_some() { format!("Chop {}", i + 1) } else { l.name.to_string() }, style),
             ])
         })
         .collect::<Vec<_>>();
@@ -468,7 +490,7 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
     f.render_widget(grid, main[1]);
 
     let footer = Paragraph::new(
-        "arrows=move  space=toggle  p=play  x=clear row  X=clear all  +/- BPM  [ ] master  r=render  ?=help  q=quit",
+        format!("arrows=move  space=toggle  p=play  s=samples  x=clear row  X=clear all  +/- BPM  [ ] master  r=render  ?=help  q=quit\n{}", app.status),
     )
     .style(Style::default().fg(Color::DarkGray))
     .block(block());
@@ -476,6 +498,9 @@ fn draw_ui(f: &mut ratatui::Frame, app: &App) {
 
     if app.show_help {
         draw_help(f);
+    }
+    if let Some(editor) = &app.sample_editor {
+        samples::draw_editor(f, editor, app.cursor_lane);
     }
 }
 
@@ -502,6 +527,7 @@ fn draw_help(f: &mut ratatui::Frame) {
         entry("+ / -", "Increase / decrease BPM"),
         entry("] / [", "Raise / lower master volume"),
         entry("r", "Render the pattern to out.wav"),
+        entry("s", "Load / chop a WAV on the current track"),
         entry("?", "Toggle this help"),
         entry("q / Ctrl-C", "Quit"),
         Line::from(""),
@@ -602,6 +628,9 @@ struct EngineState {
     master_gain: f32,
 
     grid: [[bool; STEPS]; LANES],
+    samples: [Option<SampleSlice>; LANES],
+    sample_voices: [SampleVoice; LANES],
+    preview: SampleVoice,
 
     // timing
     samples_per_step: f32,
@@ -630,6 +659,9 @@ impl EngineState {
             bpm,
             master_gain: MASTER_GAIN_DEFAULT,
             grid: [[false; STEPS]; LANES],
+            samples: std::array::from_fn(|_| None),
+            sample_voices: std::array::from_fn(|_| SampleVoice::default()),
+            preview: SampleVoice::default(),
 
             samples_per_step,
             step_phase: 0.0,
@@ -669,6 +701,8 @@ impl EngineState {
                         self.clap.reset();
                         self.tom.reset();
                         self.rim.reset();
+                        self.sample_voices.iter_mut().for_each(|v| *v = SampleVoice::default());
+                        self.preview = SampleVoice::default();
                     }
                 }
                 EngineCmd::SetBpm(b) => {
@@ -683,6 +717,17 @@ impl EngineState {
                 EngineCmd::SetMasterGain(g) => {
                     self.master_gain = g.clamp(MASTER_GAIN_MIN, MASTER_GAIN_MAX)
                 }
+                EngineCmd::SetSample { lane, sample } if lane < LANES => {
+                    self.samples[lane] = sample;
+                    self.sample_voices[lane] = SampleVoice::default();
+                    match lane {
+                        0 => self.kick.reset(), 1 => self.snare.reset(),
+                        2 => self.hat.reset(), 3 => self.clap.reset(),
+                        4 => self.tom.reset(), _ => self.rim.reset(),
+                    }
+                }
+                EngineCmd::SetSample { .. } => {}
+                EngineCmd::Preview(sample) => self.preview = SampleVoice::new(sample),
             }
         }
     }
@@ -699,22 +744,27 @@ impl EngineState {
             self.playhead_step.store(self.step_index, Ordering::Relaxed);
 
             // trigger on step boundary
-            if self.grid[0][self.step_index] {
+            for lane in 0..LANES {
+                if self.grid[lane][self.step_index] && self.samples[lane].is_some() {
+                    self.sample_voices[lane] = SampleVoice::new(self.samples[lane].clone());
+                }
+            }
+            if self.grid[0][self.step_index] && self.samples[0].is_none() {
                 self.kick.trigger();
             }
-            if self.grid[1][self.step_index] {
+            if self.grid[1][self.step_index] && self.samples[1].is_none() {
                 self.snare.trigger();
             }
-            if self.grid[2][self.step_index] {
+            if self.grid[2][self.step_index] && self.samples[2].is_none() {
                 self.hat.trigger();
             }
-            if self.grid[3][self.step_index] {
+            if self.grid[3][self.step_index] && self.samples[3].is_none() {
                 self.clap.trigger();
             }
-            if self.grid[4][self.step_index] {
+            if self.grid[4][self.step_index] && self.samples[4].is_none() {
                 self.tom.trigger();
             }
-            if self.grid[5][self.step_index] {
+            if self.grid[5][self.step_index] && self.samples[5].is_none() {
                 self.rim.trigger();
             }
         }
@@ -726,7 +776,9 @@ impl EngineState {
             + self.hat.next()
             + self.clap.next()
             + self.tom.next()
-            + self.rim.next();
+            + self.rim.next()
+            + self.sample_voices.iter_mut().map(|v| v.next(self.sr)).sum::<f32>()
+            + self.preview.next(self.sr);
         // Drive the summed mix into the soft-clipper. Higher master_gain means
         // a hotter, harder-hitting signal that still can't clip past +/-1.0.
         (s * self.master_gain).tanh()
@@ -734,8 +786,8 @@ impl EngineState {
 
     fn render_f32(&mut self, out: &mut [f32], ch: usize) {
         let frames = out.len() / ch;
-        self.advance_steps(frames);
         for i in 0..frames {
+            self.advance_steps(1);
             let s = self.next_sample();
             for c in 0..ch {
                 out[i * ch + c] = s;
@@ -745,8 +797,8 @@ impl EngineState {
 
     fn render_i16(&mut self, out: &mut [i16], ch: usize) {
         let frames = out.len() / ch;
-        self.advance_steps(frames);
         for i in 0..frames {
+            self.advance_steps(1);
             let s = self.next_sample().clamp(-1.0, 1.0);
             let v = (s * i16::MAX as f32) as i16;
             for c in 0..ch {
@@ -757,8 +809,8 @@ impl EngineState {
 
     fn render_u16(&mut self, out: &mut [u16], ch: usize) {
         let frames = out.len() / ch;
-        self.advance_steps(frames);
         for i in 0..frames {
+            self.advance_steps(1);
             let s = self.next_sample().clamp(-1.0, 1.0);
             let u = ((s * 0.5 + 0.5) * u16::MAX as f32) as u16;
             for c in 0..ch {
@@ -948,7 +1000,7 @@ impl DrumRim {
 }
 
 
-fn render_wav(pat: &Pattern, path: &str) -> Result<()> {
+fn render_wav(pat: &Pattern, samples: &[Option<SampleSlice>; LANES], master_gain: f32, path: &str) -> Result<()> {
     let sample_rate = 44_100u32;
 
     let spec = hound::WavSpec {
@@ -964,32 +1016,18 @@ fn render_wav(pat: &Pattern, path: &str) -> Result<()> {
     let sec_per_step = sec_per_beat / 4.0;
     let seconds = sec_per_step * STEPS as f32;
     let frames = (seconds * sample_rate as f32) as usize;
-    let samples_per_step = (sec_per_step * sample_rate as f32) as usize;
+    let mut engine = EngineState::new(sample_rate as f32, Arc::new(AtomicUsize::new(0)));
+    engine.grid = pat.grid;
+    engine.samples = samples.clone();
+    engine.master_gain = master_gain;
+    engine.samples_per_step = bpm_to_samples_per_step(sample_rate as f32, pat.bpm);
+    engine.step_phase = engine.samples_per_step;
+    engine.step_index = STEPS - 1;
+    engine.playing = true;
 
-    let mut kick = DrumKick::new(sample_rate as f32);
-    let mut snare = DrumSnare::new(sample_rate as f32);
-    let mut hat = DrumHat::new(sample_rate as f32);
-    let mut clap = DrumClap::new(sample_rate as f32);
-    let mut tom = DrumTom::new(sample_rate as f32);
-    let mut rim = DrumRim::new(sample_rate as f32);
-
-    for i in 0..frames {
-        let step = (i / samples_per_step) % STEPS;
-        let step_start = (i % samples_per_step) == 0;
-
-        if step_start {
-            if pat.grid[0][step] { kick.trigger(); }
-            if pat.grid[1][step] { snare.trigger(); }
-            if pat.grid[2][step] { hat.trigger(); }
-            if pat.grid[3][step] { clap.trigger(); }
-            if pat.grid[4][step] { tom.trigger(); }
-            if pat.grid[5][step] { rim.trigger(); }
-        }
-
-        let s = (kick.next() + snare.next() + hat.next() + clap.next() + tom.next() + rim.next())
-            .tanh()
-            * 0.7;
-        let v = (s * i16::MAX as f32) as i16;
+    for _ in 0..frames {
+        engine.advance_steps(1);
+        let v = (engine.next_sample() * i16::MAX as f32) as i16;
         w.write_sample(v)?;
         w.write_sample(v)?;
     }
@@ -1004,7 +1042,7 @@ mod tests {
 
     /// Build an App wired to a live channel (receiver kept alive so sends
     /// succeed) for exercising `handle_key` in isolation.
-    fn test_app() -> (App, crossbeam_channel::Receiver<EngineCmd>) {
+    pub(super) fn test_app() -> (App, crossbeam_channel::Receiver<EngineCmd>) {
         let (tx, rx) = crossbeam_channel::unbounded::<EngineCmd>();
         let lanes = [
             Lane { name: "Kick" },
@@ -1025,6 +1063,9 @@ mod tests {
             cursor_lane: 0,
             cursor_step: 0,
             show_help: false,
+            samples: std::array::from_fn(|_| None),
+            sample_editor: None,
+            status: String::new(),
             playhead_step: Arc::new(AtomicUsize::new(0)),
             tx,
         };
